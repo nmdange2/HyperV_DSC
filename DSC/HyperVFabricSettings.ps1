@@ -1,7 +1,6 @@
 Configuration HyperVFabricSettings {
     Import-DscResource -ModuleName 'PSDscResources'
     Import-DscResource -ModuleName 'ComputerManagementDsc'
-    Import-DscResource -ModuleName 'xRemoteDesktopAdmin'
     Import-DscResource -ModuleName 'NetworkingDsc'
 	Import-DscResource -ModuleName 'xHyper-V'
 	Import-DscResource -ModuleName 'DataCenterBridging'
@@ -66,7 +65,7 @@ Configuration HyperVFabricSettings {
     {
 		WindowsFeatureSet FileServer
         {
-            Name = @("FS-FileServer", "FS-Data-Deduplication")
+            Name = @("FS-FileServer", "FS-Data-Deduplication") #File Server VSS No longer needed?
             Ensure = 'Present'
         }
 	}
@@ -75,7 +74,7 @@ Configuration HyperVFabricSettings {
 
 	node $AllNodes.NodeName {
 		$configSet = $ConfigurationData.ConfigSet.Where{$_.ConfigName -eq $Node.Config}
-
+		
         TimeZone TimeZone
         {
             IsSingleInstance = 'Yes'
@@ -89,10 +88,11 @@ Configuration HyperVFabricSettings {
         }
     
 		# Turn on Remote Desktop with Network Level Authentication
-        xRemoteDesktopAdmin RemoteDesktopSettings
+        RemoteDesktopAdmin RemoteDesktopSettings
         {
-           Ensure = 'Present'
-           UserAuthentication = 'Secure'
+            IsSingleInstance   = 'yes'
+            Ensure             = 'Present'
+            UserAuthentication = 'Secure'
         }
 
 		Firewall AllowRemoteDesktopTCP
@@ -619,14 +619,6 @@ Configuration HyperVFabricSettings {
 					$sriov = 1
 				}
 
-				NetAdapterAdvancedProperty "SRIOVNic$i"
-				{
-					NetworkAdapterName = $nicName
-					RegistryKeyword = "*SRIOV"
-					RegistryValue = $sriov
-					DependsOn = "[NetAdapterName]RenameNIC$i"
-				}
-
 				if($configSet.Has_Virtual_SMB_NIC)
 				{
 					# Only enable jumbo packets on the host NIC if there are virtual SMB NICs
@@ -640,6 +632,8 @@ Configuration HyperVFabricSettings {
 
 					if($configSet."NIC_$($i)_Type" -notin("Generic1g","Generic10g"))
 					{
+						$sriov = 1 # Enable SR-IOV on the host NIC in case we need guest RDMA
+
 						NetAdapterRdma "EnableRDMANIC$i"
 						{
 							Name = $nicName
@@ -670,11 +664,22 @@ Configuration HyperVFabricSettings {
 						}
 					}#>
 				}
+
+				if($sriov -eq 1) # make sure SRIOV is enabled if it should be, but don't disable it if it doesn't need to be enabled
+				{
+					NetAdapterAdvancedProperty "SRIOVNic$i"
+					{
+						NetworkAdapterName = $nicName
+						RegistryKeyword = "*SRIOV"
+						RegistryValue = $sriov
+						DependsOn = "[NetAdapterName]RenameNIC$i"
+					}
+				}
 			}
 			elseif($Node.Role -contains "SOFS")
 			{
-				# VMQ and SRIOV are not needed on SOFS nodes
-				NetAdapterAdvancedProperty "VMQDisableNic$i"
+				# VMQ and SRIOV are not needed on SOFS nodes, but disabling them on the NICs probably isn't necessary
+				<#NetAdapterAdvancedProperty "VMQDisableNic$i"
 				{
 					NetworkAdapterName = $nicName
 					RegistryKeyword = "*VMQ"
@@ -688,12 +693,16 @@ Configuration HyperVFabricSettings {
 					RegistryKeyword = "*SRIOV"
 					RegistryValue = 0
 					DependsOn = "[NetAdapterName]RenameNIC$i"
-				}
+				}#>
 			}
 		}
 
 		if($Node.Role -contains "HyperV")
 		{
+			#Write-Host $Node.NodeName
+			#Write-Host $configSet.ConfigName
+			#Write-Host $configSet.HyperVSwitchMinBandwidthMode
+
 			# This may not work to correctly create the VM switch to comply with VMM's settings
 			# For now, don't apply this configuration until VMM has created the virtual switch
 			xVMSwitch HyperVVMSwitch
@@ -703,7 +712,7 @@ Configuration HyperVFabricSettings {
 				NetAdapterName = [string[]]$nicList
 				AllowManagementOS = $true
 				EnableEmbeddedTeaming = $true
-				BandwidthReservationMode = 'Weight'
+				BandwidthReservationMode = $configSet.HyperVSwitchMinBandwidthMode
 				LoadBalancingAlgorithm = 'HyperVPort'
 				DependsOn = '[WindowsFeatureSet]HyperV', $teamDepends
 			}
@@ -719,6 +728,41 @@ Configuration HyperVFabricSettings {
 				Name = $configSet.HyperVHostVNicName
 				DependsOn = '[xVMSwitch]HyperVVMSwitch'
 			}#>
+
+			# Configure SMB Bandwidth Limit for Live Migration
+			if($configSet.SMB_LiveMig_BW_Limit -ne $null)
+			{
+				WindowsFeature FSSMBBW
+				{
+					Name = 'FS-SMBBW'
+					Ensure = 'Present'
+				}
+
+				Script SMBLMBWLimit
+				{
+					GetScript = {
+					 return @{ 'Result' = 'Result' }
+					 }
+
+					SetScript = {
+						#Write-Verbose 'SetScript XXX'
+
+						Set-SMBBandwidthLimit -Category LiveMigration -BytesPerSecond $using:configSet.SMB_LiveMig_BW_Limit
+					}
+
+					TestScript = {
+						#Write-Verbose 'Start TestScript XXX'
+						$bw = Get-SMBBandwidthLimit -Category LiveMigration -ErrorAction SilentlyContinue
+						if($bw -eq $null)
+						{
+							return $false
+						}
+						return ($bw.BytesPerSecond -eq $using:configSet.SMB_LiveMig_BW_Limit);
+					}
+
+					DependsOn = '[WindowsFeature]FSSMBBW'
+				}
+			}
 		}
 
 		$hasIwarp = $false
@@ -763,7 +807,8 @@ Configuration HyperVFabricSettings {
 					RegistryValue = $configSet."SMB_NIC_$($i)_VLAN"
 					DependsOn = "[NetAdapterName]RenameSMBNIC$i"
 				}
-
+				
+				<# It's probably not actually necessary to disable VMQ or SR-IOV although they aren't used
 				NetAdapterAdvancedProperty "VMQDisableSMBNic$i"
 				{
 					NetworkAdapterName = $nicName
@@ -779,7 +824,7 @@ Configuration HyperVFabricSettings {
 					RegistryValue = 0
 					DependsOn = "[NetAdapterName]RenameSMBNIC$i"
 				}
-
+				#>
                 if($configSet.EnableDCB -and $configSet."SMB_NIC_$($i)_Mode" -in('iWARP','RoCEv1','RoCEv2'))
                 {
                     DCBNetAdapterQos "EnableQosSMBNIC$i"
@@ -826,7 +871,7 @@ Configuration HyperVFabricSettings {
 
                 if($configSet.EnableDCB)
                 {
-					# Ensule priority tag is passed to the physical NIC
+					# Ensure priority tag is passed to the physical NIC
                     VMNetworkAdapterSettings "SMBvNICIeeePriority$i"
                     {
                         VMName = 'ManagementOS'
@@ -835,12 +880,6 @@ Configuration HyperVFabricSettings {
                         DependsOn = '[WindowsFeatureSet]HyperV', '[xVMSwitch]HyperVVMSwitch'
                     }
                 }
-			}
-
-			NetBios "DisableNetBiosSMBNIC$i"
-			{
-				InterfaceAlias = $nicName
-				Setting = "Disable"
 			}
 
 			NetIPInterface "DisableDhcpSMBNIC$i"
@@ -855,6 +894,13 @@ Configuration HyperVFabricSettings {
 				IPAddress = $Node."SMB_NIC_$($i)_IP"
 				InterfaceAlias = $nicName
 				AddressFamily = 'IPv4'
+			}
+
+			NetBios "DisableNetBiosSMBNIC$i"
+			{
+				InterfaceAlias = $nicName
+				Setting = "Disable"
+				DependsOn = "[IPAddress]IPAddrSMBNIC$i"
 			}
 
 			NetAdapterAdvancedProperty "JumboPacketSMBNic$i"
@@ -920,7 +966,7 @@ Configuration HyperVFabricSettings {
 				{
 					IsSingleInstance = 'Yes'
 					EnableEnhancedSessionMode = $true
-					MaximumStorageMigrations = 4
+					MaximumStorageMigrations = 2
 					MaximumVirtualMachineMigrations = 4
 					NumaSpanningEnabled = $false
 					VirtualMachineMigrationEnabled = $true
@@ -976,13 +1022,6 @@ Configuration HyperVFabricSettings {
 				Enabled = 'True'
 			}
 
-			NetBios DisableNetBiosHostvNIC
-			{
-				InterfaceAlias = "vEthernet ($($configSet.HyperVSwitchName))"
-				Setting = "Disable"
-				DependsOn = '[WindowsFeatureSet]HyperV','[xVMSwitch]HyperVVMSwitch'
-			}
-
 			NetIPInterface DisableDhcpHostvNIC
 			{
 				InterfaceAlias = "vEthernet ($($configSet.HyperVSwitchName))"
@@ -996,6 +1035,13 @@ Configuration HyperVFabricSettings {
 				IPAddress = $Node.HostIP
 				InterfaceAlias = "vEthernet ($($configSet.HyperVSwitchName))"
 				AddressFamily = 'IPv4'
+				DependsOn = '[WindowsFeatureSet]HyperV','[xVMSwitch]HyperVVMSwitch'
+			}
+
+			NetBios DisableNetBiosHostvNIC
+			{
+				InterfaceAlias = "vEthernet ($($configSet.HyperVSwitchName))"
+				Setting = "Disable"
 				DependsOn = '[WindowsFeatureSet]HyperV','[xVMSwitch]HyperVVMSwitch'
 			}
 
@@ -1050,13 +1096,6 @@ Configuration HyperVFabricSettings {
 
 			}
 
-			NetBios DisableNetBiosHostvNIC
-			{
-				InterfaceAlias = $configSet.SOFS_NetLbfoTeamName
-				Setting = "Disable"
-				DependsOn = '[WaitForNetworkTeam]WaitForHostTeam'
-			}
-
 			NetIPInterface DisableDhcpHostvNIC
 			{
 				InterfaceAlias = $configSet.SOFS_NetLbfoTeamName
@@ -1071,6 +1110,13 @@ Configuration HyperVFabricSettings {
 				InterfaceAlias = $configSet.SOFS_NetLbfoTeamName
 				AddressFamily = 'IPv4'
 				DependsOn = '[WaitForNetworkTeam]WaitForHostTeam'
+			}
+
+			NetBios DisableNetBiosHostvNIC
+			{
+				InterfaceAlias = $configSet.SOFS_NetLbfoTeamName
+				Setting = "Disable"
+				DependsOn = '[WaitForNetworkTeam]WaitForHostTeam','[IPAddress]IPAddrHostvNIC'
 			}
 		}
     }

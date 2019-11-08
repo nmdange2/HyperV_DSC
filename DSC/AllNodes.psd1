@@ -315,6 +315,7 @@
 			SMB_NIC_2_VLAN = 104
 			SMB_NIC_2_Mode = 'RoCEv2'
 			SMB_NIC_2_DefaultName = 'SMB_2'
+			SMB_LiveMig_BW_Limit = 1000MB
 		}
 	)
 

@@ -13,7 +13,6 @@ These scripts are only for configuring individual hosts.  To build a failover cl
 - Currently the DSC script can't completely deploy a virtual switch, it must be done using System Center Virtual Machine Manager
 - On Windows Server 2019, RSS/VMQ settings do not need to be changed.  I have not built the script to apply optimal RSS settings on Windows Server 2016.
 - When using RDMA NICs, Live Migration will be configured for SMB.  When not using RDMA NICs, Live Migration will be configured for Compression.
-- The script does not yet configure SMB Bandwidth Limits for Live Migration
 - The GuardedHost role will install the necessary features for supporting Shielded VMs but does not configure the HGS Attestation URLs, Code Integrity Policies, etc.
 
 ## Supported Scale-Out File Server configurations
@@ -207,6 +206,10 @@ The SMB mode for this NIC
 >&nbsp;&nbsp;&nbsp;&nbsp;SMB_NIC_n_DefaultName = 'Name'
 
 The default name of the storage NIC.  For virtual NICs use "vEthernet (Name)"
+
+>&nbsp;&nbsp;&nbsp;&nbsp;SMB_LiveMig_BW_Limit = Number
+
+Optionally specify the SMB Bandwdith Limit for Live Migration
 
 >&nbsp;&nbsp;&nbsp;&nbsp;SOFS_NetLbfoTeamName
 
